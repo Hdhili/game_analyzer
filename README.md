@@ -2,4 +2,4 @@
 
 pip install -r requirements.txt
 
-- Then save the file "RunGameAnalayzer" as an "All type" file, and it should be a shortcut to the app.
+- In the file "RunGameAnalayzer", change "path_to_the_code" with the actual path where you saved it. Then save it as an "All type" file, and it should be a shortcut to the app.
