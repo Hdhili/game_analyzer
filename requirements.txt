@@ -1,0 +1,8 @@
+streamlit
+transformers
+seaborn
+matplotlib
+steamreviews
+steamfront
+torch
+tqdm
