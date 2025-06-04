@@ -1,4 +1,4 @@
 @echo off
-cd "C:\Users\hdhil\OneDrive\Desktop\projet stage\game_analyzer.py"
+cd "path_to_the_code"
 streamlit run game_analyzer.py
 pause
