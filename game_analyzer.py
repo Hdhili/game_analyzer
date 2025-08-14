@@ -1,306 +1,363 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
 import requests
 import torch
 import time
 from typing import List, Dict
-from transformers import (
-    pipeline,
-    AutoTokenizer,
-    AutoModelForSequenceClassification
-)
-from tqdm import tqdm
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import plotly.express as px
+import math
 
-# MUST BE FIRST STREAMLIT COMMAND
-st.set_page_config(page_title="Game Review Analyzer", layout="wide")
+st.set_page_config(page_title="Fast Parallel Game Review Analyzer", layout="wide")
 
-# Cache models and heavy resources
-@st.cache_resource
-def load_models():
-    # Load theme classifier
-    theme_classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
-    
-    # Load custom sentiment model
-    repo_id = "hdhili/distilbert-sentiment"
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(repo_id)
-        model = AutoModelForSequenceClassification.from_pretrained(repo_id)
-        sentiment_classifier = pipeline(
-            "sentiment-analysis",
-            model=model,
-            tokenizer=tokenizer,
-            device=0 if torch.cuda.is_available() else -1
-        )
-    except Exception as e:
-        st.error(f"Failed to load custom model: {str(e)} - Falling back to default model")
-        sentiment_classifier = pipeline("sentiment-analysis")
-    
-    return theme_classifier, sentiment_classifier
-
-theme_classifier, sentiment_classifier = load_models()
-
-# ----- Game Search -----
-@st.cache_data(ttl=3600)
-def search_games_steam_store(query: str, limit: int = 5) -> List[Dict]:
-    """Search for games on Steam Store API"""
-    try:
-        url = f"https://store.steampowered.com/api/storesearch/?term={query}&cc=us&l=en"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return [
-            {"name": item["name"], "appid": item["id"]}
-            for item in response.json().get("items", [])[:limit]
-        ]
-    except Exception as e:
-        st.error(f"Search failed: {str(e)}")
-        return []
-
-# ----- Review Scraping (using direct Steam API) -----
-@st.cache_data(ttl=3600)
-def scrape_reviews(app_id: str, num_reviews: int = 200) -> List[str]:
-    """Scrape reviews directly from Steam API"""
-    try:
-        url = f"https://store.steampowered.com/appreviews/{app_id}"
-        params = {
-            'json': 1,
-            'filter': 'recent',
-            'language': 'english',
-            'review_type': 'all',
-            'purchase_type': 'all',
-            'num_per_page': 100,
-            'cursor': '*'
-        }
-        
-        all_reviews = []
-        cursor = '*'
-        total_fetched = 0
-        
-        with st.spinner(f"Fetching reviews (0/{num_reviews})..."):
-            status_text = st.empty()
-            
-            while total_fetched < num_reviews:
-                params['cursor'] = cursor
-                response = requests.get(url, params=params)
-                if response.status_code != 200:
-                    st.error(f"Request failed with status {response.status_code}")
-                    break
-
-                data = response.json()
-                reviews = data.get('reviews', [])
-                if not reviews:
-                    st.warning("No more reviews found.")
-                    break
-
-                for review in reviews:
-                    all_reviews.append(review['review'])
-                    if len(all_reviews) >= num_reviews:
-                        break
-
-                total_fetched = len(all_reviews)
-                cursor = data.get('cursor')
-                status_text.text(f"Fetching reviews ({total_fetched}/{num_reviews})...")
-                time.sleep(0.5)
-
-        return all_reviews[:num_reviews]
-        
-    except Exception as e:
-        st.error(f"Review scraping failed: {str(e)}")
-        return []
-
+# -------------------------
+# Helpers / Utilities
+# -------------------------
 def split_into_quotes(text: str) -> List[str]:
-    """Split text into meaningful quotes"""
-    connectors = ["but", "however", "although", "still", "yet"]
+    connectors = [
+        "but", "however", "although", "still", "yet",
+        "mais", "cependant", "pourtant", "toutefois"
+    ]
     for conn in connectors:
         text = text.replace(f" {conn} ", f". {conn} ")
-    return [quote.strip() for quote in text.split(".") if quote.strip()]
+    return [q.strip() for q in text.split(".") if q.strip()]
 
-def analyze_reviews(reviews: List[str], candidate_labels: List[str]) -> pd.DataFrame:
-    """Analyze reviews for themes and sentiment"""
-    results = []
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, review in enumerate(tqdm(reviews, desc="Analyzing reviews")):
-        try:
-            quotes = split_into_quotes(review)
-            for quote in quotes:
-                # Theme classification
-                theme_out = theme_classifier(quote, candidate_labels)
-                top_theme = theme_out["labels"][0]
-                theme_score = theme_out["scores"][0]
-                
-                # Sentiment analysis
-                sentiment_out = sentiment_classifier(quote)[0]
-                
-                results.append({
-                    "review_id": i,
-                    "quote": quote,
-                    "predicted_theme": top_theme,
-                    "theme_confidence": round(theme_score, 3),
-                    "predicted_sentiment": sentiment_out["label"].lower(),
-                    "sentiment_score": round(sentiment_out["score"], 3),
-                })
-            
-            # Update progress
-            progress = (i + 1) / len(reviews)
-            progress_bar.progress(progress)
-            status_text.text(f"Processed {i+1}/{len(reviews)} reviews ({progress:.0%})")
-            
-        except Exception as e:
-            st.warning(f"Skipping review due to error: {str(e)}")
-    
-    progress_bar.empty()
-    status_text.empty()
-    df = pd.DataFrame(results)
-    df['predicted_sentiment'] = df['predicted_sentiment'].replace({
-    'label_1': 'positive',
-    'label_0': 'negative'
-    })
-    
-    return df
+@st.cache_data(ttl=3600)
+def search_games_steam_store(query: str, limit: int = 8) -> List[Dict]:
+    try:
+        url = f"https://store.steampowered.com/api/storesearch/?term={query}&cc=us&l=en"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        items = r.json().get("items", [])[:limit]
+        return [{"name": it["name"], "appid": it["id"]} for it in items]
+    except Exception:
+        return []
 
-def create_visualizations(df: pd.DataFrame):
-    """Create and display visualizations with pie charts"""
-    if df.empty:
-        st.warning("No data to visualize")
-        return
-    
-    st.subheader("📊 Theme Analysis")
-    
-    # Calculate theme statistics
-    theme_counts = df['predicted_theme'].value_counts()
-    sentiment_by_theme = df.groupby(['predicted_theme', 'predicted_sentiment']).size().unstack().fillna(0)
-    
-    # Create two columns for the pie charts
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Theme distribution pie chart
-        st.write("### Theme Distribution")
-        fig1, ax1 = plt.subplots(figsize=(6, 6))
-        ax1.pie(
-            theme_counts,
-            labels=theme_counts.index,
-            autopct='%1.1f%%',
-            startangle=90,
-            colors=plt.cm.Pastel1.colors
-        )
-        ax1.axis('equal')  # Equal aspect ratio ensures pie is drawn as a circle
-        st.pyplot(fig1)
-    
-    with col2:
-        # Sentiment distribution pie chart
-        st.write("### Overall Sentiment")
-        sentiment_counts = df['predicted_sentiment'].value_counts()
-        fig2, ax2 = plt.subplots(figsize=(6, 6))
-        ax2.pie(
-            sentiment_counts,
-            labels=sentiment_counts.index,
-            autopct='%1.1f%%',
-            startangle=90,
-            colors=["#72fc65", "#DE6B6B"]  # Green for positive, orange for negative
-        )
-        ax2.axis('equal')
-        st.pyplot(fig2)
-    
-    # Create donut charts for each theme's sentiment breakdown
-    st.write("### Sentiment Breakdown by Theme")
-    
-    # Get a list of colors for the themes
-    theme_colors = plt.cm.tab20.colors
-    
-    # Create a grid of subplots
-    n_themes = len(theme_counts)
-    n_cols = 3
-    n_rows = (n_themes + n_cols - 1) // n_cols
-    
-    fig3, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
-    axes = axes.flatten()  # Flatten in case it's a 2D array
-    
-    for i, (theme, counts) in enumerate(sentiment_by_theme.iterrows()):
-        ax = axes[i]
-        # Create donut chart
-        wedges, texts, autotexts = ax.pie(
-            counts,
-            labels=counts.index,
-            autopct='%1.1f%%',
-            startangle=90,
-            colors=["#DE6B6B", "#72fc65"],
-            wedgeprops=dict(width=0.7)  # This makes it a donut chart
-        )
-        
-        # Set title with theme name and total count
-        ax.set_title(f"{theme}\n({counts.sum()} mentions)", fontsize=10)
-        
-        # Make the percentages more visible
-        for autotext in autotexts:
-            autotext.set_color('white')
-            autotext.set_fontsize(8)
-    
-    # Hide any unused subplots
-    for j in range(i+1, len(axes)):
-        axes[j].axis('off')
-    
-    plt.tight_layout()
-    st.pyplot(fig3)
+@st.cache_data(ttl=3600)
+def fetch_steam_reviews(app_id: str, num_reviews: int, lang: str, progress_step: int = 10) -> List[str]:
+    """
+    Fetch reviews from Steam. progress_step controls how often cursor updates are saved into cache,
+    but Streamlit progress will be updated outside via callback. Returns list of review texts.
+    """
+    url = f"https://store.steampowered.com/appreviews/{app_id}"
+    params = {
+        "json": 1,
+        "filter": "recent",
+        "language": "french" if lang == "fr" else "english",
+        "review_type": "all",
+        "purchase_type": "all",
+        "num_per_page": 100,
+        "cursor": "*"
+    }
+    reviews = []
+    cursor = "*"
+    # Note: This function is cached; the progress UI will be handled by the caller via progress_callback.
+    while len(reviews) < num_reviews:
+        params["cursor"] = cursor
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            break
+        data = r.json()
+        batch = data.get("reviews", [])
+        if not batch:
+            break
+        for item in batch:
+            reviews.append(item.get("review", ""))
+            if len(reviews) >= num_reviews:
+                break
+        cursor = data.get("cursor", "")
+        if not cursor:
+            break
+        time.sleep(0.08)  # polite pause
+    return reviews[:num_reviews]
 
-def main():
-    st.title("🎮 Game Review Theme Analyzer")
-    st.markdown("Using custom sentiment model: `hdhili/distilbert-sentiment`")
-    
-    # Game search
-    query = st.text_input("Enter game name:", placeholder="e.g. Cyberpunk 2077")
-    
+@st.cache_resource
+def load_models(lang_code: str, theme_model_name: str):
+    """
+    Returns theme_classifier, sentiment_classifier.
+    Cached by Streamlit so repeated runs are fast.
+    """
+    device = 0 if torch.cuda.is_available() else -1
+
+    # Load theme zero-shot model
+    try:
+        theme_classifier = pipeline("zero-shot-classification", model=theme_model_name, device=device)
+    except Exception:
+        theme_classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli", device=device)
+
+    # Sentiment model selection
+    if lang_code == "fr":
+        sentiment_repo = "tblard/tf-allocine"
+    else:
+        sentiment_repo = "hdhili/distilbert-sentiment"
+
+    try:
+        tok = AutoTokenizer.from_pretrained(sentiment_repo)
+        mdl = AutoModelForSequenceClassification.from_pretrained(sentiment_repo)
+        sentiment_classifier = pipeline("sentiment-analysis", model=mdl, tokenizer=tok, device=device)
+    except Exception:
+        # fallback to default HF sentiment
+        sentiment_classifier = pipeline("sentiment-analysis", device=device)
+
+    return theme_classifier, sentiment_classifier
+
+# -------------------------
+# UI - Sidebar (controls)
+# -------------------------
+st.title("🎮 Fast Parallel Game Review Analyzer")
+
+with st.sidebar:
+    st.header("Settings")
+
+    # Language
+    lang_choice = st.selectbox("Review language", options=["English", "French"])
+    lang_code = "fr" if lang_choice.lower() == "french" else "en"
+
+    # Theme model choice
+    st.subheader("Theme model (zero-shot)")
+    theme_model_choice = st.selectbox(
+        "Pick model",
+        [
+            "facebook/bart-large-mnli (accurate, heavy)",
+            "MoritzLaurer/deberta-v3-base-mnli-fever-anli (faster)",
+            "joeddav/xlm-roberta-large-xnli (multilingual)"
+        ]
+    )
+    theme_model_map = {
+        "facebook/bart-large-mnli (accurate, heavy)": "facebook/bart-large-mnli",
+        "MoritzLaurer/deberta-v3-base-mnli-fever-anli (faster)": "MoritzLaurer/deberta-v3-base-mnli-fever-anli",
+        "joeddav/xlm-roberta-large-xnli (multilingual)": "joeddav/xlm-roberta-large-xnli",
+    }
+    theme_model_name = theme_model_map[theme_model_choice]
+
+    # candidate labels default by language (user editable)
+    default_labels = (
+        "graphismes, jouabilité, histoire, performance, prix"
+        if lang_code == "fr"
+        else "graphics, gameplay, story, performance, price"
+    )
+    candidate_labels_input = st.text_input("Themes (comma separated)", value=default_labels)
+    candidate_labels = [lbl.strip() for lbl in candidate_labels_input.split(",") if lbl.strip()]
+
+    # performance tuning
+    st.markdown("**Performance & batching**")
+    device_msg = "GPU" if torch.cuda.is_available() else "CPU"
+    st.write(f"Detected device: **{device_msg}**")
+
+    # sensible defaults depending on device
+    if torch.cuda.is_available():
+        batch_default = 32
+        workers_default = 8
+    else:
+        batch_default = 8
+        workers_default = 4
+
+    batch_size = st.number_input("Batch size (quotes per model call)", min_value=1, max_value=256, value=batch_default, step=1)
+    max_workers = st.number_input("Thread workers (parallel batches)", min_value=1, max_value=64, value=workers_default, step=1)
+
+    st.markdown("---")
+    st.write("Tips:")
+    st.write("- Use larger batch size on GPU for speed.")
+    st.write("- Decrease batch size on CPU to avoid OOM.")
+
+# -------------------------
+# Main inputs
+# -------------------------
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    query = st.text_input("Search Steam games by name (press Enter to search):")
+    games = []
     if query:
-        with st.spinner("Searching for games..."):
+        with st.spinner("Searching Steam store..."):
             games = search_games_steam_store(query)
-        
-        if games:
-            selected_game = st.selectbox(
-                "Select the game:",
-                games,
-                format_func=lambda x: x["name"]
-            )
-            
-            # Analysis parameters
-            col1, col2 = st.columns(2)
-            with col1:
-                num_reviews = st.slider("Number of reviews", 50, 20000, 1000)
-            with col2:
-                candidate_labels = st.text_input(
-                    "Themes to analyze (comma separated):",
-                    value="graphics, gameplay, story, performance, price"
-                )
-                candidate_labels = [lbl.strip() for lbl in candidate_labels.split(",") if lbl.strip()]
-            
-            if st.button("Analyze Reviews", type="primary"):
-                reviews = scrape_reviews(selected_game["appid"], num_reviews)
-                
-                if reviews:
-                    start_time = time.time()
-                    df = analyze_reviews(reviews, candidate_labels)
-                    elapsed = time.time() - start_time
-                    
-                    st.success(f"Analyzed {len(df)} quotes from {len(reviews)} reviews in {elapsed:.1f} seconds")
-                    
-                    # Show results
-                    st.dataframe(df.head(100))
-                    create_visualizations(df)
-                    
-                    # Download option
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        "Download full results",
-                        csv,
-                        f"{selected_game['name']}_review_analysis.csv",
-                        "text/csv"
-                    )
-                else:
-                    st.warning("No reviews found or error fetching reviews.")
+        if not games:
+            st.warning("No games found for that query.")
         else:
-            st.warning("No games found matching your search.")
+            game_choice = st.selectbox("Select a game", options=games, format_func=lambda x: x["name"])
+with col2:
+    num_reviews = st.number_input("Number of reviews to fetch", min_value=50, max_value=20000, value=1000, step=50)
+    analyze_btn = st.button("Analyze Reviews", type="primary")
 
-if __name__ == "__main__":
-    main()
+# -------------------------
+# Run analysis when button clicked
+# -------------------------
+if analyze_btn and query and games:
+    # Load models
+    with st.spinner("Loading models (cached if already downloaded)..."):
+        theme_classifier, sentiment_classifier = load_models(lang_code, theme_model_name)
+    st.success(f"Models ready — theme model: {theme_model_name}")
+
+    # Scrape reviews with progress
+    scrape_progress = st.progress(0.0)
+    scrape_text = st.empty()
+    start_scrape = time.time()
+
+    # Because fetch_steam_reviews is cached and doesn't accept a progress callback safely,
+    # we'll fetch in a loop here and update progress UI manually (uncached path).
+    def fetch_with_progress(app_id: str, n: int, lang: str):
+        url = f"https://store.steampowered.com/appreviews/{app_id}"
+        params = {
+            "json": 1,
+            "filter": "recent",
+            "language": "french" if lang == "fr" else "english",
+            "review_type": "all",
+            "purchase_type": "all",
+            "num_per_page": 100,
+            "cursor": "*"
+        }
+        reviews = []
+        cursor = "*"
+        while len(reviews) < n:
+            params["cursor"] = cursor
+            try:
+                r = requests.get(url, params=params, timeout=15)
+                if r.status_code != 200:
+                    break
+                data = r.json()
+            except Exception:
+                break
+            batch = data.get("reviews", [])
+            if not batch:
+                break
+            for item in batch:
+                reviews.append(item.get("review", ""))
+                # update progress every 5 reviews to avoid UI thrashing
+                if len(reviews) % 5 == 0 or len(reviews) == n:
+                    scrape_progress.progress(min(len(reviews) / n, 1.0))
+                    scrape_text.text(f"Fetched {len(reviews)}/{n} reviews...")
+                if len(reviews) >= n:
+                    break
+            cursor = data.get("cursor", "")
+            if not cursor:
+                break
+            time.sleep(0.06)
+        scrape_progress.progress(1.0)
+        scrape_text.text(f"Fetched {len(reviews)}/{n} reviews (took {time.time()-start_scrape:.1f}s)")
+        return reviews[:n]
+
+    reviews = fetch_with_progress(game_choice["appid"], int(num_reviews), lang_code)
+
+    if not reviews:
+        st.warning("No reviews fetched. Try a smaller number or check the App ID.")
+    else:
+        # Extract quotes
+        quotes: List[str] = []
+        review_ids: List[int] = []
+        for i, rv in enumerate(reviews):
+            qs = split_into_quotes(rv)
+            quotes.extend(qs)
+            review_ids.extend([i] * len(qs))
+
+        st.info(f"Extracted {len(quotes)} quotes from {len(reviews)} reviews.")
+
+        # Prepare batches
+        total_quotes = len(quotes)
+        total_batches = math.ceil(total_quotes / batch_size)
+        batches = [quotes[i:i+batch_size] for i in range(0, total_quotes, batch_size)]
+
+        # classification progress UI
+        classify_progress = st.progress(0.0)
+        classify_text = st.empty()
+        start_cls = time.time()
+
+        # Function to process batch: theme + sentiment
+        def process_batch(batch_quotes: List[str]):
+            # theme predictions
+            theme_out = theme_classifier(batch_quotes, candidate_labels)
+            if isinstance(theme_out, dict):
+                theme_out = [theme_out]
+            # sentiment predictions
+            sent_out = sentiment_classifier(batch_quotes)
+            if isinstance(sent_out, dict):
+                sent_out = [sent_out]
+
+            merged = []
+            for t, s, q in zip(theme_out, sent_out, batch_quotes):
+                merged.append({
+                    "quote": q,
+                    "predicted_theme": (t.get("labels") or [None])[0],
+                    "theme_confidence": round((t.get("scores") or [0])[0], 3),
+                    "predicted_sentiment": str(s.get("label", "")).lower(),
+                    "sentiment_score": round(float(s.get("score", 0)), 3)
+                })
+            return merged
+
+        # Run batches in parallel threads
+        results = []
+        with ThreadPoolExecutor(max_workers=int(max_workers)) as exe:
+            future_to_idx = {exe.submit(process_batch, b): idx for idx, b in enumerate(batches)}
+            completed = 0
+            for future in as_completed(future_to_idx):
+                batch_res = future.result()
+                results.extend(batch_res)
+                completed += 1
+                classify_progress.progress(min(completed / total_batches, 1.0))
+                classify_text.text(f"Classified {completed}/{total_batches} batches")
+
+        classify_progress.progress(1.0)
+        classify_text.text(f"Classification finished in {time.time()-start_cls:.1f}s — {len(results)} quote predictions")
+
+        # Build final DataFrame
+        df_out = pd.DataFrame(results)
+        df_out["predicted_sentiment"] = df_out["predicted_sentiment"].replace({
+            "label_1": "positive",
+            "label_0": "negative",
+            "positif": "positive",
+            "négatif": "negative"
+        }).str.lower()
+
+        # -------------------------
+        # Filters & Charts
+        # -------------------------
+        st.subheader("Interactive analysis & filtering")
+
+        # Filters
+        unique_themes = sorted(df_out["predicted_theme"].dropna().unique().tolist())
+        unique_sents = sorted(df_out["predicted_sentiment"].dropna().unique().tolist())
+
+        left, right = st.columns([3, 1])
+        with left:
+            theme_filter = st.multiselect("Filter by theme", options=unique_themes, default=unique_themes)
+            sentiment_filter = st.multiselect("Filter by sentiment", options=unique_sents, default=unique_sents)
+            keyword = st.text_input("Search keyword in quote", value="")
+        with right:
+            st.write("Results")
+            st.metric("Quotes", len(df_out))
+            st.metric("Unique themes", len(unique_themes))
+
+        # Apply filters
+        filtered = df_out[
+            df_out["predicted_theme"].isin(theme_filter) &
+            df_out["predicted_sentiment"].isin(sentiment_filter)
+        ]
+        if keyword:
+            filtered = filtered[filtered["quote"].str.contains(keyword, case=False, na=False)]
+
+        st.write(f"Showing {len(filtered)} quotes after filters")
+
+        # Interactive plots using plotly
+        fig1 = px.histogram(filtered, x="predicted_sentiment", color="predicted_sentiment",
+                            title="Sentiment Distribution", template="plotly_white")
+        fig2 = px.histogram(filtered, x="predicted_theme", color="predicted_theme",
+                            title="Theme Distribution (filtered)", template="plotly_white", height=450)
+
+        col_a, col_b = st.columns(2)
+        col_a.plotly_chart(fig1, use_container_width=True)
+        col_b.plotly_chart(fig2, use_container_width=True)
+
+        # Sentiment by theme sunburst for quick insight
+        if not filtered.empty:
+            sun = px.sunburst(filtered, path=["predicted_theme", "predicted_sentiment"], values=None,
+                              title="Theme → Sentiment breakdown (sunburst)")
+            st.plotly_chart(sun, use_container_width=True)
+
+        # Data table and download
+        st.subheader("Filtered quotes")
+        st.dataframe(filtered.head(300))
+
+        csv = filtered.to_csv(index=False).encode("utf-8")
+        st.download_button("Download filtered CSV", csv, file_name=f"{game_choice['name']}_filtered_quotes.csv", mime="text/csv")
+
+        st.success("Analysis complete ✅")
